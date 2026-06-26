@@ -1,0 +1,83 @@
+# Build directories
+build/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+cmake-build-*/
+host/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+rules.ninja
+Makefile
+Testing/
+CTestTestfile.cmake
+
+# Embedded build artifacts
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.o
+*.obj
+*.d
+*.a
+*.su
+*.cyclo
+*.gcno
+*.gcda
+
+# Host application binaries and runtime captures
+host/g474_pd_host
+host/*.csv
+host/*.log
+host/*.jsonl
+host/capture_*.*
+tools/capture_*.*
+
+# Python/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# STM32CubeIDE / Eclipse local metadata
+.metadata/
+.recommenders/
+.settings/*.prefs
+.settings/language.settings.xml
+.cproject
+.project
+.launches/
+*.launch
+
+# CubeMX scratch/backup files
+mx.scratch/
+*.ioc.bak
+*.ioc.backup
+*.ioc.old
+*.mxproject.bak
+
+# Editor and OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Codex/local assistant workspace state
+.agents/
+.codex/
+
+# Keep STM32CubeIDE bundle metadata if present in this project.
+!.settings/
+!.settings/*.store.json
