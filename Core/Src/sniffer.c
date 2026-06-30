@@ -6,6 +6,7 @@
 #include "sniffer.h"
 #include "main.h"
 #include "usb_device_app.h"
+#include "usb_thunder_if.h"
 #include <string.h>
 
 #ifdef REV1
@@ -124,8 +125,9 @@ static inline uint64_t get_timestamp64(uint16_t cnt) {
 #endif
 // ── Host activity control ─────────────────────────────────────────
 void sniffer_host_start(void) {
-  if (g_sniffer_state != SNIFFER_STATE_IDLE)
-    return;
+  if (g_sniffer_state != SNIFFER_STATE_IDLE) {
+    sniffer_host_stop();
+  }
 
   // Reset ring counters so stale data isn't sent
   sniffer_init();

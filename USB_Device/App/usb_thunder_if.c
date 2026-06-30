@@ -27,6 +27,21 @@
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
+static volatile uint8_t start_capture_request = 0U;
+static volatile uint8_t stop_capture_request = 0U;
+
+uint8_t USB_Thunder_ConsumeStartRequest(void) {
+  uint8_t request = start_capture_request;
+  start_capture_request = 0U;
+  return request;
+}
+
+uint8_t USB_Thunder_ConsumeStopRequest(void) {
+  uint8_t request = stop_capture_request;
+  stop_capture_request = 0U;
+  return request;
+}
+
 /* ============================================================================
  * Private Helper: Build and send a command response on EP1 IN
  * ============================================================================*/
@@ -67,20 +82,14 @@ uint8_t USBD_THUNDER_CMD_Received(uint8_t *buf, uint32_t len) {
   switch (cmd->cmd_id) {
   /* ------------------------------------------------------------------ */
   case CMD_ID_START_CAPTURE:
-    /* USER CODE BEGIN CMD_START_CAPTURE */
-    /* sniffer_start_capture();          */
-    /* adc_task_start();                 */
-    /* USER CODE END CMD_START_CAPTURE   */
+    start_capture_request = 1U;
     msg_len = (uint8_t)snprintf(msg, sizeof(msg), "OK:CAPTURE_STARTED");
     SendResponse(cmd->cmd_id, THUNDER_RESP_OK, msg, msg_len);
     break;
 
   /* ------------------------------------------------------------------ */
   case CMD_ID_STOP_CAPTURE:
-    /* USER CODE BEGIN CMD_STOP_CAPTURE */
-    /* sniffer_stop_capture();           */
-    /* adc_task_stop();                  */
-    /* USER CODE END CMD_STOP_CAPTURE   */
+    stop_capture_request = 1U;
     msg_len = (uint8_t)snprintf(msg, sizeof(msg), "OK:CAPTURE_STOPPED");
     SendResponse(cmd->cmd_id, THUNDER_RESP_OK, msg, msg_len);
     break;
@@ -137,10 +146,7 @@ uint8_t USBD_THUNDER_CMD_Received(uint8_t *buf, uint32_t len) {
 
   /* ------------------------------------------------------------------ */
   case CMD_ID_RESET:
-    /* USER CODE BEGIN CMD_RESET                         */
-    /* sniffer_stop_capture();                           */
-    /* adc_task_stop();                                  */
-    /* USER CODE END CMD_RESET                           */
+    stop_capture_request = 1U;
     msg_len = (uint8_t)snprintf(msg, sizeof(msg), "OK:RESET");
     SendResponse(cmd->cmd_id, THUNDER_RESP_OK, msg, msg_len);
     break;

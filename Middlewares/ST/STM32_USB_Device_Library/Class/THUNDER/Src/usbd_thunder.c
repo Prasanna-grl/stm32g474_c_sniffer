@@ -272,15 +272,6 @@ static uint8_t USBD_THUNDER_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum) {
     return (uint8_t)USBD_FAIL;
   hthunder = (USBD_THUNDER_HandleTypeDef *)pdev->pClassData;
 
-  /* ZLP handling — send zero-length packet if last packet was full size */
-  if ((pdev->ep_in[epnum & 0xFU].total_length > 0U) &&
-      ((pdev->ep_in[epnum & 0xFU].total_length %
-        pdev->ep_in[epnum & 0xFU].maxpacket) == 0U)) {
-    pdev->ep_in[epnum & 0xFU].total_length = 0U;
-    (void)USBD_LL_Transmit(pdev, epnum, NULL, 0U);
-    return (uint8_t)USBD_OK;
-  }
-
   /* ---- EP1 IN: CC Sniffer TX complete ---- */
   if ((epnum & 0x7FU) == (THUNDER_EP_SNIFFER_IN & 0x7FU)) {
     hthunder->SnifferTxState = 0U;

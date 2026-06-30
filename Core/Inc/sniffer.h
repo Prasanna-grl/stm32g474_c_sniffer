@@ -121,6 +121,7 @@ void sniffer_start_capture(void);
 /* Buffer management */
 void sniffer_process_dma_buffer(uint8_t channel, uint8_t buffer_idx);
 void sniffer_task(void);
+void analog_task(void);
 /* Status and statistics */
 uint32_t sniffer_get_overflow_count(void);
 void sniffer_reset_overflow_count(void);

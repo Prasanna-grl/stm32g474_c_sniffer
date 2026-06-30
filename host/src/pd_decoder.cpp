@@ -42,6 +42,8 @@ const std::map<uint8_t, const char *> CONTROL_MESSAGE_TYPES = {
     {0x0B, "VCONN_Swap"},
     {0x0C, "Wait"},
     {0x0D, "Soft_Reset"},
+    {0x0E, "Data_Reset"},
+    {0x0F, "Data_Reset_Complete"},
     {0x10, "Not_Supported"},
     {0x11, "Get_Source_Cap_Extended"},
     {0x12, "Get_Status"},
@@ -49,6 +51,8 @@ const std::map<uint8_t, const char *> CONTROL_MESSAGE_TYPES = {
     {0x14, "Get_PPS_Status"},
     {0x15, "Get_Country_Codes"},
     {0x16, "Get_Sink_Cap_Extended"},
+    {0x17, "Get_Source_Info"},
+    {0x18, "Get_Revision"},
 };
 
 const std::map<uint8_t, const char *> DATA_MESSAGE_TYPES = {
@@ -59,6 +63,11 @@ const std::map<uint8_t, const char *> DATA_MESSAGE_TYPES = {
     {0x05, "Battery_Status"},
     {0x06, "Alert"},
     {0x07, "Get_Country_Info"},
+    {0x08, "Enter_USB"},
+    {0x09, "EPR_Request"},
+    {0x0A, "EPR_Mode"},
+    {0x0B, "Source_Info"},
+    {0x0C, "Revision"},
     {0x0F, "Vendor_Defined"},
 };
 
@@ -119,8 +128,7 @@ std::string ordered_set_name(const std::vector<uint8_t> &symbols,
 }
 
 std::vector<uint8_t> decode_payload_symbols(const std::vector<uint8_t> &symbols,
-                                            std::size_t begin,
-                                            std::size_t end,
+                                            std::size_t begin, std::size_t end,
                                             bool *ok) {
   std::vector<uint8_t> nibbles;
   for (std::size_t i = begin; i < end; ++i) {
@@ -140,7 +148,8 @@ std::vector<uint8_t> decode_payload_symbols(const std::vector<uint8_t> &symbols,
   std::vector<uint8_t> payload;
   payload.reserve(nibbles.size() / 2u);
   for (std::size_t i = 0; i < nibbles.size(); i += 2u) {
-    payload.push_back(static_cast<uint8_t>(nibbles[i] | (nibbles[i + 1] << 4u)));
+    payload.push_back(
+        static_cast<uint8_t>(nibbles[i] | (nibbles[i + 1] << 4u)));
   }
   *ok = true;
   return payload;
@@ -234,8 +243,8 @@ void decode_edges_to_bits(const std::vector<uint16_t> &samples,
 
 void bits_to_symbols(const std::vector<uint8_t> &bits,
                      const std::vector<uint64_t> &owners,
-                     const std::vector<uint32_t> &timestamps, std::size_t offset,
-                     std::vector<uint8_t> &symbols,
+                     const std::vector<uint32_t> &timestamps,
+                     std::size_t offset, std::vector<uint8_t> &symbols,
                      std::vector<uint64_t> &symbol_owners,
                      std::vector<uint32_t> &symbol_timestamps) {
   for (std::size_t pos = offset; pos + 4u < bits.size(); pos += 5u) {
@@ -253,7 +262,8 @@ std::vector<PdPacket> find_packets(uint8_t channel,
                                    const std::vector<uint8_t> &bits,
                                    const std::vector<uint64_t> &owners,
                                    const std::vector<uint32_t> &timestamps,
-                                   bool include_crc_bad) {
+                                   bool include_crc_bad,
+                                   std::vector<DecodeIssue> &issues) {
   std::vector<PdPacket> packets;
 
   for (std::size_t offset = 0; offset < 5u; ++offset) {
@@ -279,7 +289,8 @@ std::vector<PdPacket> find_packets(uint8_t channel,
         packet.record_index = symbol_owners[index];
         packet.timestamp_us = symbol_timestamps[index];
         packet.ordered_set = name;
-        packet.symbols.assign(symbols.begin() + index, symbols.begin() + index + 4);
+        packet.symbols.assign(symbols.begin() + index,
+                              symbols.begin() + index + 4);
         packet.crc_ok = true;
         packets.push_back(packet);
         index += 4u;
@@ -296,6 +307,17 @@ std::vector<PdPacket> find_packets(uint8_t channel,
       }
 
       if (eop_index == symbols.size()) {
+        DecodeIssue issue;
+        issue.channel = channel;
+        issue.bit_offset = static_cast<uint8_t>(offset);
+        issue.symbol_index = static_cast<uint32_t>(index);
+        issue.record_index = symbol_owners[index];
+        issue.timestamp_us = symbol_timestamps[index];
+        issue.ordered_set = name;
+        issue.reason = "missing_eop";
+        issue.symbols.assign(symbols.begin() + index,
+                             symbols.begin() + scan_end);
+        issues.push_back(std::move(issue));
         ++index;
         continue;
       }
@@ -319,6 +341,31 @@ std::vector<PdPacket> find_packets(uint8_t channel,
           packet.crc_ok = ok;
           packets.push_back(std::move(packet));
         }
+        if (!ok) {
+          DecodeIssue issue;
+          issue.channel = channel;
+          issue.bit_offset = static_cast<uint8_t>(offset);
+          issue.symbol_index = static_cast<uint32_t>(index);
+          issue.record_index = symbol_owners[index];
+          issue.timestamp_us = symbol_timestamps[index];
+          issue.ordered_set = name;
+          issue.reason = "crc_bad";
+          issue.symbols.assign(symbols.begin() + index,
+                               symbols.begin() + eop_index + 1u);
+          issues.push_back(std::move(issue));
+        }
+      } else {
+        DecodeIssue issue;
+        issue.channel = channel;
+        issue.bit_offset = static_cast<uint8_t>(offset);
+        issue.symbol_index = static_cast<uint32_t>(index);
+        issue.record_index = symbol_owners[index];
+        issue.timestamp_us = symbol_timestamps[index];
+        issue.ordered_set = name;
+        issue.reason = "payload_4b5b_error";
+        issue.symbols.assign(symbols.begin() + index,
+                             symbols.begin() + eop_index + 1u);
+        issues.push_back(std::move(issue));
       }
 
       index = eop_index + 1u;
@@ -335,9 +382,6 @@ PdDecoder::PdDecoder(DecodeConfig config) : config_(config) {}
 void PdDecoder::add_record(uint64_t index, const RawRecord &record) {
   auto edge = parse_edge_record(index, record);
   if (!edge) {
-    return;
-  }
-  if (edge->overflow && !config_.include_overflow) {
     return;
   }
   streams_[edge->channel].push_back(*edge);
@@ -357,7 +401,8 @@ DecodeResult PdDecoder::decode() const {
         ++summary.overflow_records;
       }
       if (previous) {
-        const uint8_t expected = static_cast<uint8_t>((previous->chunk + 1u) & 0x07u);
+        const uint8_t expected =
+            static_cast<uint8_t>((previous->chunk + 1u) & 0x07u);
         if (record.chunk != expected && record.chunk != 0) {
           ++summary.chunk_order_warnings;
         }
@@ -368,7 +413,17 @@ DecodeResult PdDecoder::decode() const {
     std::vector<uint16_t> samples;
     std::vector<uint64_t> owners;
     std::vector<uint32_t> timestamps;
-    samples_for_stream(records, samples, owners, timestamps);
+    std::vector<EdgeRecord> decode_records;
+    if (config_.include_overflow) {
+      decode_records = records;
+    } else {
+      for (const auto &record : records) {
+        if (!record.overflow) {
+          decode_records.push_back(record);
+        }
+      }
+    }
+    samples_for_stream(decode_records, samples, owners, timestamps);
     drop_consecutive_duplicates(samples, owners, timestamps);
 
     std::vector<uint8_t> bits;
@@ -379,7 +434,7 @@ DecodeResult PdDecoder::decode() const {
     summary.decoded_bits = static_cast<uint32_t>(bits.size());
 
     auto packets = find_packets(channel, bits, bit_owners, bit_timestamps,
-                                config_.include_crc_bad);
+                                config_.include_crc_bad, result.issues);
     result.packets.insert(result.packets.end(), packets.begin(), packets.end());
   }
 
@@ -421,8 +476,8 @@ std::string header_summary(const std::vector<uint8_t> &payload) {
   const uint16_t header = read_le16(payload.data());
   std::ostringstream out;
   out << std::hex << std::setfill('0') << "hdr=0x" << std::setw(4) << header
-      << std::dec << " type=0x" << std::hex << std::setw(2)
-      << (header & 0x1Fu) << std::dec << " rev=" << ((header >> 6u) & 0x03u)
+      << std::dec << " type=0x" << std::hex << std::setw(2) << (header & 0x1Fu)
+      << std::dec << " rev=" << ((header >> 6u) & 0x03u)
       << " id=" << ((header >> 9u) & 0x07u)
       << " objs=" << ((header >> 12u) & 0x07u)
       << " pr=" << ((header >> 8u) & 0x01u)
@@ -440,6 +495,17 @@ std::string format_packet(const PdPacket &packet) {
       << (packet.crc_ok ? "CRC_OK" : "CRC_BAD") << ' '
       << message_name(packet.payload) << ' ' << header_summary(packet.payload)
       << " bytes=" << hex_bytes(packet.payload);
+  return out.str();
+}
+
+std::string format_decode_issue(const DecodeIssue &issue) {
+  std::ostringstream out;
+  out << "CC" << static_cast<unsigned>(issue.channel + 1u)
+      << " rec=" << issue.record_index << " ts_us=" << issue.timestamp_us
+      << " offset=" << static_cast<unsigned>(issue.bit_offset)
+      << " sym=" << issue.symbol_index << ' ' << issue.ordered_set
+      << " DECODE_ERR " << issue.reason
+      << " symbols=" << hex_bytes(issue.symbols);
   return out.str();
 }
 

@@ -26,16 +26,26 @@ UsbDevice::UsbDevice(uint16_t vid, uint16_t pid, int interface_number)
   rc = libusb_set_auto_detach_kernel_driver(handle_, 1);
   (void)rc;
 
-  rc = libusb_claim_interface(handle_, interface_number_);
-  if (rc != 0) {
-    throw std::runtime_error("libusb_claim_interface failed: " + usb_error(rc));
+  const int interfaces_to_claim[] = {interface_number_, 1};
+  for (int iface : interfaces_to_claim) {
+    if (claimed_interfaces_.count(iface) != 0u) {
+      continue;
+    }
+    rc = libusb_claim_interface(handle_, iface);
+    if (rc != 0) {
+      throw std::runtime_error("libusb_claim_interface " +
+                               std::to_string(iface) +
+                               " failed: " + usb_error(rc));
+    }
+    claimed_interfaces_.insert(iface);
   }
-  claimed_ = true;
 }
 
 UsbDevice::~UsbDevice() {
-  if (handle_ && claimed_) {
-    libusb_release_interface(handle_, interface_number_);
+  if (handle_) {
+    for (int iface : claimed_interfaces_) {
+      libusb_release_interface(handle_, iface);
+    }
   }
   if (handle_) {
     libusb_close(handle_);
@@ -59,6 +69,21 @@ std::vector<uint8_t> UsbDevice::bulk_read(uint8_t endpoint, int read_size,
   }
   buffer.resize(static_cast<std::size_t>(transferred));
   return buffer;
+}
+
+void UsbDevice::bulk_write(uint8_t endpoint, const std::vector<uint8_t> &data,
+                           unsigned timeout_ms) {
+  int transferred = 0;
+  const int rc = libusb_bulk_transfer(
+      handle_, endpoint, const_cast<unsigned char *>(data.data()),
+      static_cast<int>(data.size()), &transferred, timeout_ms);
+  if (rc != 0) {
+    throw std::runtime_error("libusb_bulk_transfer write failed: " +
+                             usb_error(rc));
+  }
+  if (transferred != static_cast<int>(data.size())) {
+    throw std::runtime_error("short USB bulk write");
+  }
 }
 
 } // namespace g474

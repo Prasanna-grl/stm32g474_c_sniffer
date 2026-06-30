@@ -8,6 +8,7 @@
 #include <chrono>
 #include <csignal>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -18,6 +19,11 @@
 #include <vector>
 
 namespace {
+
+constexpr uint8_t kCmdOutEndpoint = 0x02;
+constexpr uint8_t kCmdStartCapture = 0x01;
+constexpr uint8_t kCmdStopCapture = 0x02;
+constexpr std::size_t kCommandPacketSize = 64;
 
 volatile std::sig_atomic_t g_stop = 0;
 std::mutex g_print_mutex;
@@ -36,6 +42,7 @@ struct Args {
   int interface_number = 0;
   uint8_t endpoint = 0x81;
   uint8_t analog_endpoint = 0x82;
+  uint8_t command_endpoint = kCmdOutEndpoint;
   int read_size = 512;
   unsigned timeout_ms = 1000;
   uint64_t max_records = 4096;
@@ -45,9 +52,13 @@ struct Args {
   std::string out_ana_raw;
   std::string out_ana_csv;
   std::string out_events_csv;
+  std::string out_header_csv;
   StreamMode mode = StreamMode::Pd;
   bool include_overflow = false;
   bool show_crc_bad = false;
+  bool show_decode_errors = false;
+  bool decode_at_end = false;
+  bool send_capture_commands = true;
 };
 
 uint32_t parse_int(const std::string &text) {
@@ -78,15 +89,20 @@ void usage(const char *argv0) {
       << "  --out-ana-csv PATH     Save decoded analog CSV\n"
       << "  --out-csv PATH         Save combined PD/analog timeline CSV\n"
       << "  --out-events-csv PATH  Alias for --out-csv\n"
+      << "  --out-header-csv PATH  Save raw 8-byte record header diagnostics\n"
       << "  --vid VALUE            USB VID, default 0x227f\n"
       << "  --pid VALUE            USB PID, default 0x0009\n"
       << "  --interface VALUE      USB interface, default 0\n"
       << "  --endpoint VALUE       USB IN endpoint, default 0x81\n"
       << "  --ana-endpoint VALUE   Analog IN endpoint, default 0x82\n"
+      << "  --cmd-endpoint VALUE   Command OUT endpoint, default 0x02\n"
       << "  --read-size VALUE      USB read size, default 512\n"
       << "  --timeout-ms VALUE     USB read timeout, default 1000\n"
       << "  --records VALUE        Max live records, default 4096\n"
+      << "  --decode-at-end        Do not decode/print PD while live reading\n"
+      << "  --no-capture-cmd       Do not send START/STOP capture commands\n"
       << "  --include-overflow     Decode records with firmware overflow flag\n"
+      << "  --show-decode-errors   Print malformed SOP decode candidates\n"
       << "  --show-crc-bad         Print packets with bad CRC too\n";
 }
 
@@ -118,6 +134,8 @@ Args parse_args(int argc, char **argv) {
       args.out_events_csv = need_value("--out-csv");
     } else if (arg == "--out-events-csv") {
       args.out_events_csv = need_value("--out-events-csv");
+    } else if (arg == "--out-header-csv") {
+      args.out_header_csv = need_value("--out-header-csv");
     } else if (arg == "--pd") {
       args.mode = StreamMode::Pd;
     } else if (arg == "--ana") {
@@ -135,14 +153,23 @@ Args parse_args(int argc, char **argv) {
     } else if (arg == "--ana-endpoint") {
       args.analog_endpoint =
           static_cast<uint8_t>(parse_int(need_value("--ana-endpoint")));
+    } else if (arg == "--cmd-endpoint") {
+      args.command_endpoint =
+          static_cast<uint8_t>(parse_int(need_value("--cmd-endpoint")));
     } else if (arg == "--read-size") {
       args.read_size = static_cast<int>(parse_int(need_value("--read-size")));
     } else if (arg == "--timeout-ms") {
       args.timeout_ms = parse_int(need_value("--timeout-ms"));
     } else if (arg == "--records") {
       args.max_records = parse_int(need_value("--records"));
+    } else if (arg == "--decode-at-end") {
+      args.decode_at_end = true;
+    } else if (arg == "--no-capture-cmd") {
+      args.send_capture_commands = false;
     } else if (arg == "--include-overflow") {
       args.include_overflow = true;
+    } else if (arg == "--show-decode-errors") {
+      args.show_decode_errors = true;
     } else if (arg == "--show-crc-bad") {
       args.show_crc_bad = true;
     } else {
@@ -213,6 +240,52 @@ std::string analog_event_csv_row(const g474::AnalogSnapshot &snapshot) {
   return out.str();
 }
 
+std::string header_csv_header() {
+  return "record,kind,header_hex,seq_hex,channel,overflow,seq8,seq4,chunk,"
+         "timestamp_us,timestamp,edge_marker,chunk_marker,first_sample,last_sample\n";
+}
+
+std::string record_kind_name(g474::RecordKind kind) {
+  switch (kind) {
+  case g474::RecordKind::Short:
+    return "short";
+  case g474::RecordKind::Edge:
+    return "edge";
+  case g474::RecordKind::Analog:
+    return "analog";
+  case g474::RecordKind::Unknown:
+    return "unknown";
+  }
+  return "unknown";
+}
+
+std::string header_csv_row(uint64_t index, const g474::RawRecord &record) {
+  const auto kind = g474::classify_record(record);
+  const uint16_t seq = g474::read_le16(record.data());
+  const uint32_t timestamp_us = g474::read_le32(record.data() + 2);
+  const uint8_t channel = (seq & 0x4000u) ? 1u : 0u;
+  const bool overflow = (seq & 0x8000u) != 0;
+  const uint8_t seq8 = static_cast<uint8_t>((seq & 0x0FF0u) >> 4u);
+  const uint8_t seq4 = static_cast<uint8_t>(seq8 & 0x0Fu);
+  const uint8_t chunk = static_cast<uint8_t>(seq & 0x07u);
+  const uint16_t first_sample = g474::read_le16(record.data() + 8);
+  const uint16_t last_sample = g474::read_le16(record.data() + 62);
+
+  std::ostringstream out;
+  out << index << ',' << record_kind_name(kind) << ','
+      << csv_escape(g474::hex_bytes(record.data(), 8)) << ",0x" << std::hex
+      << std::setfill('0') << std::setw(4) << seq << std::dec << ','
+      << (kind == g474::RecordKind::Edge ? static_cast<unsigned>(channel + 1u)
+                                          : 0u)
+      << ',' << (overflow ? 1 : 0) << ',' << static_cast<unsigned>(seq8)
+      << ',' << static_cast<unsigned>(seq4) << ',' << static_cast<unsigned>(chunk)
+      << ',' << timestamp_us << ',' << g474::format_time_us(timestamp_us) << ",0x" << std::hex
+      << std::setw(2) << static_cast<unsigned>(record[6]) << ",0x"
+      << std::setw(2) << static_cast<unsigned>(record[7]) << std::dec << ','
+      << first_sample << ',' << last_sample << '\n';
+  return out.str();
+}
+
 void print_summary(const g474::DecodeResult &result) {
   const auto &cc1 = result.streams[0];
   const auto &cc2 = result.streams[1];
@@ -239,7 +312,7 @@ void print_summary(const g474::DecodeResult &result) {
     }
   }
   std::cout << "packets=" << result.packets.size() << " crc_ok=" << crc_ok
-            << '\n';
+            << " decode_errors=" << result.issues.size() << '\n';
 }
 
 void print_new_packets(const g474::DecodeResult &result,
@@ -266,6 +339,35 @@ void print_new_packets(const g474::DecodeResult &result,
   }
 }
 
+void print_new_decode_issues(const g474::DecodeResult &result,
+                             std::set<std::string> &printed,
+                             bool show_decode_errors) {
+  if (!show_decode_errors) {
+    return;
+  }
+  for (const auto &issue : result.issues) {
+    const std::string key = std::to_string(issue.channel) + ":" +
+                            std::to_string(issue.record_index) + ":" +
+                            std::to_string(issue.bit_offset) + ":" +
+                            std::to_string(issue.symbol_index) + ":" +
+                            issue.reason;
+    if (printed.insert(key).second) {
+      std::lock_guard<std::mutex> lock(g_print_mutex);
+      std::cout << g474::format_decode_issue(issue) << '\n';
+    }
+  }
+}
+
+void print_decode_issues(const g474::DecodeResult &result,
+                         bool show_decode_errors) {
+  if (!show_decode_errors) {
+    return;
+  }
+  for (const auto &issue : result.issues) {
+    std::cout << g474::format_decode_issue(issue) << '\n';
+  }
+}
+
 g474::DecodeConfig config_from_args(const Args &args) {
   g474::DecodeConfig config;
   config.include_overflow = args.include_overflow;
@@ -278,7 +380,20 @@ int decode_file(const Args &args) {
   const auto records = g474::records_from_bytes(bytes);
   g474::PdDecoder decoder(config_from_args(args));
 
+  std::ofstream header_csv;
+  if (!args.out_header_csv.empty()) {
+    header_csv.open(args.out_header_csv);
+    if (!header_csv) {
+      throw std::runtime_error("Unable to open header CSV output: " +
+                               args.out_header_csv);
+    }
+    header_csv << header_csv_header();
+  }
+
   for (std::size_t i = 0; i < records.size(); ++i) {
+    if (header_csv) {
+      header_csv << header_csv_row(i, records[i]);
+    }
     decoder.add_record(i, records[i]);
   }
 
@@ -298,6 +413,7 @@ int decode_file(const Args &args) {
   std::cout << "sample_clock=24000000Hz sample_width=16 half=30..50 "
                "full=70..100 max_gap=400\n";
   print_summary(result);
+  print_decode_issues(result, args.show_decode_errors);
   for (const auto &packet : result.packets) {
     std::cout << g474::format_packet(packet) << '\n';
   }
@@ -430,13 +546,31 @@ std::ofstream open_optional_output(const std::string &path,
   return raw_out;
 }
 
+void send_capture_command(g474::UsbDevice &dev, uint8_t endpoint,
+                          uint8_t command_id, unsigned timeout_ms) {
+  std::vector<uint8_t> packet(kCommandPacketSize, 0);
+  packet[0] = command_id;
+  packet[1] = 0;
+  dev.bulk_write(endpoint, packet, timeout_ms);
+}
+
 void pd_loop(g474::UsbDevice &dev, const Args &args,
              std::ofstream *events_csv = nullptr,
              std::mutex *events_mutex = nullptr) {
   std::ofstream raw_out = open_optional_output(args.out_raw, "PD raw");
+  std::ofstream header_csv;
+  if (!args.out_header_csv.empty()) {
+    header_csv.open(args.out_header_csv);
+    if (!header_csv) {
+      throw std::runtime_error("Unable to open header CSV output: " +
+                               args.out_header_csv);
+    }
+    header_csv << header_csv_header();
+  }
   g474::PdDecoder decoder(config_from_args(args));
   std::vector<uint8_t> partial;
   std::set<std::string> printed;
+  std::set<std::string> printed_issues;
   uint64_t record_index = 0;
 
   while (!g_stop && record_index < args.max_records) {
@@ -457,18 +591,24 @@ void pd_loop(g474::UsbDevice &dev, const Args &args,
                 record.begin());
       partial.erase(partial.begin(), partial.begin() + g474::kRecordSize);
 
+      if (header_csv) {
+        header_csv << header_csv_row(record_index, record);
+      }
       decoder.add_record(record_index, record);
       ++record_index;
 
-      if ((record_index % 32u) == 0u) {
+      if (!args.decode_at_end && (record_index % 32u) == 0u) {
         const auto result = decoder.decode();
         print_new_packets(result, printed, events_csv, events_mutex);
+        print_new_decode_issues(result, printed_issues,
+                                args.show_decode_errors);
       }
     }
   }
 
   const auto result = decoder.decode();
   print_new_packets(result, printed, events_csv, events_mutex);
+  print_new_decode_issues(result, printed_issues, args.show_decode_errors);
   {
     std::lock_guard<std::mutex> lock(g_print_mutex);
     std::cout << "PD summary:\n";
@@ -580,7 +720,19 @@ int live_capture(const Args &args) {
     std::cout << "Reading VID=0x" << std::hex << args.vid << " PID=0x"
               << args.pid << " PD_EP=0x" << static_cast<unsigned>(args.endpoint)
               << " ANA_EP=0x" << static_cast<unsigned>(args.analog_endpoint)
+              << " CMD_EP=0x" << static_cast<unsigned>(args.command_endpoint)
               << std::dec << " records=" << args.max_records << '\n';
+  }
+
+  if (args.send_capture_commands) {
+    {
+      std::lock_guard<std::mutex> lock(g_print_mutex);
+      std::cout << "Sending START_CAPTURE on EP=0x" << std::hex
+                << static_cast<unsigned>(args.command_endpoint) << std::dec
+                << '\n';
+    }
+    send_capture_command(dev, args.command_endpoint, kCmdStartCapture,
+                         args.timeout_ms);
   }
 
   if (args.mode == StreamMode::Pd) {
@@ -594,6 +746,23 @@ int live_capture(const Args &args) {
                               &events_csv, &events_mutex);
     pd_thread.join();
     analog_thread.join();
+  }
+
+  if (args.send_capture_commands) {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(g_print_mutex);
+        std::cout << "Sending STOP_CAPTURE on EP=0x" << std::hex
+                  << static_cast<unsigned>(args.command_endpoint) << std::dec
+                  << '\n';
+      }
+      send_capture_command(dev, args.command_endpoint, kCmdStopCapture,
+                           args.timeout_ms);
+    } catch (const std::exception &e) {
+      std::lock_guard<std::mutex> lock(g_print_mutex);
+      std::cerr << "warning: failed to send STOP_CAPTURE: " << e.what()
+                << '\n';
+    }
   }
 
   return 0;

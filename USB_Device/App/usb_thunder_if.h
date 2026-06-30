@@ -59,6 +59,9 @@ uint8_t USB_Thunder_Sniffer_Send(uint8_t *buf, uint16_t len);
  */
 void USB_Sniffer_TxCompleteCallback(void);
 
+uint8_t USB_Thunder_ConsumeStartRequest(void);
+uint8_t USB_Thunder_ConsumeStopRequest(void);
+
 #ifdef __cplusplus
 }
 #endif

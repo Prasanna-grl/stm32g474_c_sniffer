@@ -40,6 +40,14 @@ Decode a capture stored in this `host/` directory:
 ./build/g474_pd_host --in-bin capture_ep1.bin
 ```
 
+Dump only the EP1 raw record headers for sequence/timestamp inspection:
+
+```sh
+./build/g474_pd_host \
+  --in-bin capture_ep1.bin \
+  --out-header-csv headers.csv
+```
+
 Decode a capture produced by the Python tool in `../tools/`:
 
 ```sh
@@ -108,6 +116,15 @@ timestamp_us,timestamp,event,cc,record,message,crc_ok,summary,payload_hex,analog
 For plotting, use analog rows for voltage/current traces and PD rows as event
 markers/annotations at the same timestamp.
 
+Generate an interactive HTML chart from the combined CSV:
+
+```sh
+python3 plot_timeline.py timeline.csv --out timeline.html
+```
+
+Open `timeline.html` in a browser. The chart shows voltage/current over time
+with PD packet markers on the same x axis, plus a packet table below.
+
 For the cleanest chart file, capture raw EP1/EP2 first, then combine them
 offline. The offline combine step sorts the final CSV by timestamp:
 
@@ -128,6 +145,38 @@ Longer capture:
   --out-raw capture_long_ep1.bin
 ```
 
+Lowest-overhead PD capture test:
+
+```sh
+./build/g474_pd_host \
+  --pd \
+  --decode-at-end \
+  --records 50000 \
+  --read-size 512 \
+  --out-raw capture_ep1.bin \
+  --out-header-csv headers.csv
+```
+
+Live capture sends `START_CAPTURE` to EP2 OUT before reading and `STOP_CAPTURE`
+when it exits. This keeps firmware idle after boot and starts each capture from
+clean sniffer buffers. `--decode-at-end` keeps the live EP1 loop focused on USB
+reads and raw file writes, then decodes once at the end. If this output still
+has missing messages, check `overflow_records` and `chunk_order_warnings` in the
+summary. Non-zero values point to firmware-side backpressure or
+capture/transport loss. If those are zero, the likely issue is decoder
+interpretation or PD traffic that is not yet named/classified.
+
+`headers.csv` contains the raw 8-byte EP1 header for every record:
+
+```text
+record,kind,header_hex,seq_hex,channel,overflow,seq8,seq4,chunk,timestamp_us,...
+```
+
+`seq8` is the firmware rolling sequence field from bits `4..11`; `seq4` is the
+low-nibble view if you want to inspect the `0..15` wrap. For each continuous
+burst, `chunk` should normally walk `0..7`. The `channel` field comes directly
+from the EP1 header bit, so it is the raw CC-line source before any PD decoding.
+
 Show packets with bad CRC too:
 
 ```sh
@@ -136,6 +185,18 @@ Show packets with bad CRC too:
   --show-crc-bad \
   --out-csv timeline_pd_only.csv
 ```
+
+Show malformed SOP candidates too:
+
+```sh
+./build/g474_pd_host \
+  --in-bin capture_ep1.bin \
+  --show-decode-errors
+```
+
+This prints `DECODE_ERR` lines when a valid ordered set is seen but the packet
+cannot be decoded, for example `payload_4b5b_error`, `missing_eop`, or
+`crc_bad`.
 
 Override USB IDs if firmware descriptors change:
 
@@ -163,6 +224,7 @@ PID:        0x0009
 Interface:  0
 PD EP:      0x81
 Analog EP:  0x82
+Cmd OUT EP: 0x02
 Read size:  512 bytes
 Record:     64 bytes
 Samples:    28 x uint16_t per edge record
@@ -176,6 +238,16 @@ Clock:      24 MHz edge sample clock
 --ana   EP2 analog stream only.
 --all   EP1 PD and EP2 analog together.
 ```
+
+Live capture sends firmware capture commands by default:
+
+```text
+START_CAPTURE -> EP2 OUT 0x02 before reading
+STOP_CAPTURE  -> EP2 OUT 0x02 after reading
+```
+
+Use `--no-capture-cmd` only with old firmware that does not implement command
+controlled capture.
 
 The current analog parser expects the F0-compatible 64-byte analog packet:
 
@@ -193,6 +265,15 @@ The current analog parser expects the F0-compatible 64-byte analog packet:
 
 The PD summary prints `active_cc=CCx source=edge_stream`. This is based on EP1
 edge records/decoded bits, not analog measurements.
+
+The PD summary also prints:
+
+```text
+chunk_order_warnings
+```
+
+This should normally be zero. Use it with `overflow_records` when checking
+whether packets were actually lost before the decoder.
 
 The current firmware dummy analog stream is rate-limited to 10 ms, so expect
 about 100 analog packets per second until the INA237 DMA snapshot path replaces

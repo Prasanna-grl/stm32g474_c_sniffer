@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "sniffer.h"
+#include "usb_thunder_if.h"
 
 #include "lvgl.h"
 #include "st7789.h"
@@ -131,8 +132,7 @@ int main(void) {
   sniffer_init();
   analog_data_init();
 
-  /* Start DMA capture */
-  sniffer_start_capture();
+  /* Host sends CMD_ID_START_CAPTURE when it is ready to read EP1. */
   //  INA237_Config();
 #ifndef LVGL_DISPLAY
   ST7789_Init();
@@ -163,6 +163,12 @@ int main(void) {
     volatile uint32_t comp2_out = HAL_COMP_GetOutputLevel(&hcomp2);
     volatile uint32_t sys_freq = HAL_RCC_GetPCLK2Freq();
 #endif
+    if (USB_Thunder_ConsumeStopRequest()) {
+      sniffer_host_stop();
+    }
+    if (USB_Thunder_ConsumeStartRequest()) {
+      sniffer_host_start();
+    }
     // HAL_Delay(1);
     sniffer_task();
     analog_task();
@@ -261,9 +267,9 @@ static void MX_COMP1_Init(void) {
   /* USER CODE END COMP1_Init 1 */
   hcomp1.Instance = COMP1;
   hcomp1.Init.InputPlus = COMP_INPUT_PLUS_IO1;
-  hcomp1.Init.InputMinus = COMP_INPUT_MINUS_1_4VREFINT;
+  hcomp1.Init.InputMinus = COMP_INPUT_MINUS_1_2VREFINT;
   hcomp1.Init.OutputPol = COMP_OUTPUTPOL_NONINVERTED;
-  hcomp1.Init.Hysteresis = COMP_HYSTERESIS_50MV;
+  hcomp1.Init.Hysteresis = COMP_HYSTERESIS_30MV;
   hcomp1.Init.BlankingSrce = COMP_BLANKINGSRC_NONE;
   hcomp1.Init.TriggerMode = COMP_TRIGGERMODE_NONE;
   if (HAL_COMP_Init(&hcomp1) != HAL_OK) {
@@ -290,9 +296,9 @@ static void MX_COMP2_Init(void) {
   /* USER CODE END COMP2_Init 1 */
   hcomp2.Instance = COMP2;
   hcomp2.Init.InputPlus = COMP_INPUT_PLUS_IO1;
-  hcomp2.Init.InputMinus = COMP_INPUT_MINUS_1_4VREFINT;
+  hcomp2.Init.InputMinus = COMP_INPUT_MINUS_1_2VREFINT;
   hcomp2.Init.OutputPol = COMP_OUTPUTPOL_NONINVERTED;
-  hcomp2.Init.Hysteresis = COMP_HYSTERESIS_50MV;
+  hcomp2.Init.Hysteresis = COMP_HYSTERESIS_30MV;
   hcomp2.Init.BlankingSrce = COMP_BLANKINGSRC_NONE;
   hcomp2.Init.TriggerMode = COMP_TRIGGERMODE_NONE;
   if (HAL_COMP_Init(&hcomp2) != HAL_OK) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
 #include <vector>
 
 struct libusb_context;
@@ -18,12 +19,14 @@ public:
 
   std::vector<uint8_t> bulk_read(uint8_t endpoint, int read_size,
                                  unsigned timeout_ms);
+  void bulk_write(uint8_t endpoint, const std::vector<uint8_t> &data,
+                  unsigned timeout_ms);
 
 private:
   libusb_context *ctx_ = nullptr;
   libusb_device_handle *handle_ = nullptr;
   int interface_number_ = 0;
-  bool claimed_ = false;
+  std::set<int> claimed_interfaces_;
 };
 
 } // namespace g474
