@@ -54,13 +54,25 @@ static analog_packet_t analog_pkt;
 static volatile uint64_t filled_dma = 0;
 static volatile uint32_t seq = 0;
 
-/* Metadata arrays are indexed as channel * 4 + dma_half * 2 + group_in_half. */
-static volatile uint16_t sample_tstamp[8];
-static volatile uint16_t sample_seq[8];
-static volatile uint16_t snap_seq[8];
-static volatile uint16_t snap_tstamp[8];
-static volatile uint32_t sample_tstamp32[8];
-static volatile uint32_t snap_tstamp32[8];
+#define CAPTURE_BANK_COUNT 16u
+#define CAPTURE_BANK_MASK (CAPTURE_BANK_COUNT - 1u)
+#define CAPTURE_HALF_ITEMS (RX_EDGE_CHUNKS_PER_HALF * EDGES_PER_SLOT)
+
+typedef struct {
+  uint16_t data[CAPTURE_HALF_ITEMS];
+  uint16_t seq_group[2];
+  uint32_t timestamp32[2];
+  uint8_t channel;
+  uint8_t overflow;
+} capture_bank_t;
+
+static capture_bank_t capture_banks[CAPTURE_BANK_COUNT];
+static volatile uint8_t capture_bank_wr = 0;
+static volatile uint8_t capture_bank_rd = 0;
+static volatile uint8_t capture_bank_count = 0;
+static volatile uint8_t capture_overflow_pending = 0;
+static uint8_t capture_tx_active = 0;
+static uint8_t capture_tx_chunk = 0;
 #else
 /* ── Ring buffer absolute counters ───────────────────────────────── *
  * uint32_t never wraps in practice (160 slots/102ms → 4B slots/~8yrs)
@@ -160,75 +172,56 @@ sniffer_state_t sniffer_get_state(void) { return g_sniffer_state; }
 #ifdef REV1
 
 void sniffer_process_dma_buffer(uint8_t channel, uint8_t buffer_idx) {
-  uint8_t meta_base;
-  uint64_t mask;
-  uint64_t next;
-  uint64_t base_bit = channel * 32;
-
   __DMB(); /* ensure DMA writes to samples[] are visible */
 
-  if (buffer_idx == 0) {
-    meta_base = channel * 4;                 /* CCx first DMA half */
-    mask = (uint64_t)0x0000FFFF << base_bit; /* first 16 chunks    */
-    next = (uint64_t)0x00010000 << base_bit; /* check second half  */
-  } else {
-    meta_base = (channel * 4) + 2;           /* CCx second DMA half */
-    mask = (uint64_t)0xFFFF0000 << base_bit; /* second 16 chunks    */
-    next = (uint64_t)0x00000001 << base_bit; /* check first half    */
-  }
-
-  uint16_t ts = get_timestamp();
   uint32_t ts32 = get_timestamp32();
   uint16_t sq0 = ((seq++ << 4) & 0x0FF0) | ((uint16_t)channel << 14);
   uint16_t sq1 = ((seq++ << 4) & 0x0FF0) | ((uint16_t)channel << 14);
 
-  if (filled_dma & next) {
+  if (capture_bank_count >= CAPTURE_BANK_COUNT) {
     overflow_count++;
-    sq0 |= 0x8000; /* overflow flag for host */
-    sq1 |= 0x8000;
+    capture_overflow_pending = 1u;
+    return;
   }
 
-  if (filled_dma & mask) {
-    overflow_count++;
+  uint8_t ovf = capture_overflow_pending;
+  if (ovf) {
     sq0 |= 0x8000;
     sq1 |= 0x8000;
+    capture_overflow_pending = 0u;
   }
 
-  /* Snap: always safe to update here — __WFI ensures main loop
-   * drains previous group before this fires again in normal operation */
-  snap_seq[meta_base] = sq0;
-  snap_tstamp[meta_base] = ts;
-  snap_tstamp32[meta_base] = ts32;
-  snap_seq[meta_base + 1u] = sq1;
-  snap_tstamp[meta_base + 1u] = ts;
-  snap_tstamp32[meta_base + 1u] = ts32;
+  capture_bank_t *bank = &capture_banks[capture_bank_wr];
+  uint16_t item_off =
+      (uint16_t)(buffer_idx * RX_EDGE_CHUNKS_PER_HALF * EDGES_PER_SLOT);
 
-  sample_seq[meta_base] = sq0;
-  sample_tstamp[meta_base] = ts;
-  sample_tstamp32[meta_base] = ts32;
-  sample_seq[meta_base + 1u] = sq1;
-  sample_tstamp[meta_base + 1u] = ts;
-  sample_tstamp32[meta_base + 1u] = ts32;
+  memcpy(bank->data, &samples[channel][item_off], sizeof(bank->data));
+  bank->seq_group[0] = sq0;
+  bank->seq_group[1] = sq1;
+  bank->timestamp32[0] = ts32;
+  bank->timestamp32[1] = ts32;
+  bank->channel = channel;
+  bank->overflow = ovf;
 
-  __DMB(); /* ensure DMA writes to samples[] are visible */
+  __DMB(); /* ensure bank data is visible before publishing it */
 
-  filled_dma |= mask;
+  capture_bank_wr = (uint8_t)((capture_bank_wr + 1u) & CAPTURE_BANK_MASK);
+  capture_bank_count++;
 }
 
 void sniffer_task(void) {
   static uint8_t u = 0;
-  static uint8_t d = 0;
-  uint8_t scanned;
 
-  while (filled_dma && free_usb) {
-
-    /* ── Find next filled sub-buffer ─────────────────────── */
-    scanned = 0;
-    while (!(filled_dma & (1ULL << d))) {
-      d = (d + 1) & 63;
-      if (++scanned >= 64)
+  while (free_usb) {
+    if (!capture_tx_active) {
+      if (capture_bank_count == 0u) {
         return;
+      }
+      capture_tx_active = 1u;
+      capture_tx_chunk = 0u;
     }
+
+    capture_bank_t *bank = &capture_banks[capture_bank_rd];
 
     /* ── Find free USB buffer ─────────────────────────────── */
     if (!(free_usb & (1u << u)))
@@ -236,16 +229,12 @@ void sniffer_task(void) {
     if (!(free_usb & (1u << u)))
       return;
 
-    uint8_t ch = d >> 5;
-    uint8_t half = (d >> 4) & 1;
-    uint8_t slot_idx = d & 0x1F;
-    uint8_t group_idx = (slot_idx >> 3) & 0x01;
-    uint8_t tidx = (ch * 4) + (half * 2) + group_idx;
-    uint8_t chunk_idx = d & 0x07;
-    uint16_t item_off = (uint16_t)(slot_idx * EDGES_PER_SLOT);
+    uint8_t group_idx = (capture_tx_chunk >> 3) & 0x01;
+    uint8_t group_chunk = capture_tx_chunk & 0x07u;
+    uint16_t item_off = (uint16_t)(capture_tx_chunk * EDGES_PER_SLOT);
 
-    uint16_t seq_word = snap_seq[tidx] | (chunk_idx & 0x07);
-    uint32_t ts32 = snap_tstamp32[tidx];
+    uint16_t seq_word = bank->seq_group[group_idx] | group_chunk;
+    uint32_t ts32 = bank->timestamp32[group_idx];
     ep_buf[u][0] = (uint8_t)(seq_word & 0xFF);
     ep_buf[u][1] = (uint8_t)(seq_word >> 8);
     ep_buf[u][2] = (uint8_t)(ts32 & 0xFF);
@@ -253,20 +242,26 @@ void sniffer_task(void) {
     ep_buf[u][4] = (uint8_t)((ts32 >> 16) & 0xFF);
     ep_buf[u][5] = (uint8_t)((ts32 >> 24) & 0xFF);
     ep_buf[u][6] = EP_EDGE_PACKET_MARKER;
-    ep_buf[u][7] = (uint8_t)(EP_CHUNK_MARKER_BASE - chunk_idx);
+    ep_buf[u][7] = (uint8_t)(EP_CHUNK_MARKER_BASE - group_chunk);
 
-    memcpy(&ep_buf[u][EP_PACKET_HEADER_SIZE], &samples[ch][item_off],
+    memcpy(&ep_buf[u][EP_PACKET_HEADER_SIZE], &bank->data[item_off],
            EP_PAYLOAD_SIZE);
 
     atomic_clear_bit_u32(&free_usb, u);
 
     if (USB_Sniffer_Send_Packet(u) == 0) {
-      atomic_clear_bit_u64(&filled_dma, d);
-      d = (d + 1) & 63; // ✅ Always advance AFTER successful send
       u ^= 1u;
+      capture_tx_chunk++;
+      if (capture_tx_chunk >= RX_EDGE_CHUNKS_PER_HALF) {
+        uint32_t p = __get_PRIMASK();
+        __disable_irq();
+        capture_bank_rd = (uint8_t)((capture_bank_rd + 1u) & CAPTURE_BANK_MASK);
+        capture_bank_count--;
+        __set_PRIMASK(p);
+        capture_tx_active = 0u;
+      }
     } else {
       free_usb |= (1u << u);
-      // ✅ Do NOT advance d — retry same slot next time
       break;
     }
   }
@@ -282,15 +277,16 @@ void sniffer_init(void) {
   overflow_count = 0;
   memset(samples, 0, sizeof(samples));
   memset(ep_buf, 0, sizeof(ep_buf));
-  memset((void *)sample_tstamp, 0, sizeof(sample_tstamp));
-  memset((void *)sample_seq, 0, sizeof(sample_seq));
-  memset((void *)snap_seq, 0, sizeof(snap_seq));       // ✅ Add
-  memset((void *)snap_tstamp, 0, sizeof(snap_tstamp)); // ✅ Add
-  memset((void *)sample_tstamp32, 0, sizeof(sample_tstamp32));
-  memset((void *)snap_tstamp32, 0, sizeof(snap_tstamp32));
+  memset(capture_banks, 0, sizeof(capture_banks));
+  capture_bank_wr = 0;
+  capture_bank_rd = 0;
+  capture_bank_count = 0;
+  capture_overflow_pending = 0;
+  capture_tx_active = 0;
+  capture_tx_chunk = 0;
 }
 
-uint8_t sniffer_get_dma_status() { return (filled_dma != 0); }
+uint8_t sniffer_get_dma_status() { return (capture_bank_count != 0u); }
 
 #else
 

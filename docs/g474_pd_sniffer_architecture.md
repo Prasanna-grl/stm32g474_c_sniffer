@@ -18,7 +18,10 @@ G474 implementation uses HRTIM instead of the F0 timer setup:
 - HRTIM rollover DMA requests are enabled so sentinel samples are inserted by
   hardware.
 - DMA writes captured `uint16_t` HRTIM values into circular buffers.
-- The foreground `sniffer_task()` frames the DMA data into 64-byte USB packets.
+- DMA half/full callbacks immediately copy completed halves into a software
+  bank FIFO.
+- The foreground `sniffer_task()` frames copied FIFO banks into 64-byte USB
+  packets.
 
 The key migration difference from STM32F072B is sample width:
 
@@ -97,39 +100,60 @@ static uint16_t samples[2][RX_ITEM_COUNT];
 
 `samples[0]` is CC1 and `samples[1]` is CC2.
 
-## DMA Readiness Map
+## DMA Copy Bank FIFO
 
-The active `REV1` path uses a 64-bit readiness bitmap:
+The active `REV1` path does not send directly from the live DMA circular
+buffers. That older approach allowed USB backpressure to leave pending records
+inside `samples[][]` until DMA wrapped and overwrote them. The symptom was
+zero or low host-side chunk warnings but occasional stale/out-of-order samples
+inside otherwise valid PD packets.
+
+The current path decouples DMA capture from USB transmit using copied banks:
 
 ```c
-static volatile uint64_t filled_dma;
+#define CAPTURE_BANK_COUNT 16
+#define CAPTURE_HALF_ITEMS (RX_EDGE_CHUNKS_PER_HALF * EDGES_PER_SLOT)
+
+typedef struct {
+  uint16_t data[CAPTURE_HALF_ITEMS];
+  uint16_t seq_group[2];
+  uint32_t timestamp32[2];
+  uint8_t channel;
+  uint8_t overflow;
+} capture_bank_t;
 ```
 
-Each channel owns 32 bits:
+Each bank stores one completed DMA half:
 
 ```text
-bits 0..31:  CC1 slots
-bits 32..63: CC2 slots
+edge data:     16 chunks * 28 uint16_t samples = 448 samples
+payload bytes: 896 bytes
+metadata:      channel, overflow, two sequence groups, two timestamps
 ```
 
-Within each channel:
+DMA callbacks perform only the critical preservation step:
 
 ```text
-bits 0..15:  first DMA half
-bits 16..31: second DMA half
+HRTIM DMA half/full interrupt
+  -> copy completed half from samples[ch][offset] into next capture bank
+  -> store timestamp and sequence metadata with that bank
+  -> publish bank to FIFO
 ```
 
-When a DMA half completes, the callback publishes 16 ready slots at once:
+The foreground task then drains copied banks:
 
 ```text
-CC1 first half:  bits 0..15
-CC1 second half: bits 16..31
-CC2 first half:  bits 32..47
-CC2 second half: bits 48..63
+sniffer_task()
+  -> take oldest copied bank
+  -> emit chunk 0..15 as 16 EP1 packets
+  -> release bank after all chunks are accepted by USB
 ```
 
-`sniffer_task()` drains one ready bit at a time, converts that slot into one USB
-packet, and clears the bit only after the USB transmit is accepted.
+This adds one block `memcpy()` per DMA half-complete/full-complete event, but
+the copy is only 896 bytes. The important behavior is that USB latency can no
+longer corrupt the live DMA capture buffer. If the bank FIFO itself becomes
+full, the next published bank is dropped and the following transmitted group is
+marked with the overflow bit.
 
 ## F072B-Compatible Grouping
 
@@ -144,27 +168,9 @@ DMA half chunks 8..15:  sequence group B, chunk index 0..7
 This keeps the host-facing sequence/chunk rhythm compatible with the F072B
 packet family while preserving the larger G474 DMA buffer.
 
-Metadata arrays are indexed as:
-
-```text
-channel * 4 + dma_half * 2 + group_in_half
-```
-
-Meaning:
-
-```text
-CC1 first half, group 0:  index 0
-CC1 first half, group 1:  index 1
-CC1 second half, group 0: index 2
-CC1 second half, group 1: index 3
-CC2 first half, group 0:  index 4
-CC2 first half, group 1:  index 5
-CC2 second half, group 0: index 6
-CC2 second half, group 1: index 7
-```
-
-Each group receives its own sequence base. The chunk index is ORed into the low
-three bits when the USB packet is built.
+Each copied bank carries two sequence bases and two timestamps, one for chunks
+`0..7` and one for chunks `8..15`. The chunk index is ORed into the low three
+bits when the USB packet is built.
 
 ## Sequence Word
 
@@ -181,6 +187,11 @@ bit 15:      overflow/backpressure flag
 
 The G474 stream intentionally keeps the low three chunk bits compatible with the
 F072B header convention.
+
+The overflow bit now means the software capture-bank FIFO became full before a
+completed DMA half could be preserved. With the copied-bank architecture, a
+zero-overflow capture indicates that DMA data was preserved before USB
+packetization.
 
 ## Timestamp
 
@@ -244,3 +255,10 @@ The host parser should:
 - handle 16-bit rollover/sentinel behavior.
 
 The biggest host-side change from F072B is payload width, not packet framing.
+
+For validation, prefer `--decode-at-end` when checking packet loss. Live decode
+can temporarily print a `missing_eop` diagnostic for the newest SOP candidate
+before enough future edge records have arrived; if the same record/offset later
+prints as `CRC_OK`, that diagnostic was only an incomplete-tail artifact. A
+clean offline decode with `overflow_records=0` is the stronger packet-integrity
+check.
