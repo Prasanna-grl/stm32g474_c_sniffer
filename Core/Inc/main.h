@@ -64,6 +64,10 @@ void Error_Handler(void);
 #define RST_GPIO_Port GPIOC
 #define CS_Pin GPIO_PIN_8
 #define CS_GPIO_Port GPIOC
+#define SBU1_Pin GPIO_PIN_10
+#define SBU1_GPIO_Port GPIOC
+#define SBU2_Pin GPIO_PIN_12
+#define SBU2_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 

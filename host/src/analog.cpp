@@ -1,9 +1,19 @@
 #include "analog.hpp"
 
+#include <algorithm>
 #include <iomanip>
 #include <sstream>
 
 namespace g474 {
+
+namespace {
+
+constexpr std::size_t kSbuSourceOffset = 22;
+constexpr std::size_t kSbuCountOffset = 23;
+constexpr std::size_t kSbuPayloadOffset = 24;
+constexpr std::size_t kSbuPayloadMax = 40;
+
+} // namespace
 
 static int16_t read_le16s(const uint8_t *p) {
   return static_cast<int16_t>(read_le16(p));
@@ -38,6 +48,29 @@ std::optional<AnalogSnapshot> parse_analog_record(uint64_t index,
     snapshot.cc2_ma = read_le16s(record.data() + 14);
   }
   return snapshot;
+}
+
+std::optional<SbuChunk> parse_sbu_chunk(uint64_t index,
+                                        const RawRecord &record) {
+  const uint8_t source = record[kSbuSourceOffset];
+  if (source != 1u && source != 2u) {
+    return std::nullopt;
+  }
+
+  const uint8_t count = record[kSbuCountOffset];
+  if (count == 0u) {
+    return std::nullopt;
+  }
+
+  SbuChunk chunk;
+  chunk.index = index;
+  chunk.timestamp_us = read_le32(record.data() + 2);
+  chunk.line = source;
+  chunk.valid_count =
+      static_cast<uint8_t>(std::min<std::size_t>(count, kSbuPayloadMax));
+  chunk.data.assign(record.begin() + kSbuPayloadOffset,
+                    record.begin() + kSbuPayloadOffset + chunk.valid_count);
+  return chunk;
 }
 
 std::string format_time_us(uint64_t timestamp_us) {
@@ -85,6 +118,20 @@ std::string analog_csv_row(const AnalogSnapshot &snapshot) {
       << snapshot.vbus_mv << ',' << snapshot.vbus_ma << ','
       << snapshot.cc1_mv << ',' << snapshot.cc1_ma << ','
       << snapshot.cc2_mv << ',' << snapshot.cc2_ma << '\n';
+  return out.str();
+}
+
+std::string sbu_chunk_csv_header() {
+  return "index,timestamp_us,time,line,valid_count,raw_hex\n";
+}
+
+std::string sbu_chunk_csv_row(const SbuChunk &chunk) {
+  std::ostringstream out;
+  out << chunk.index << ',' << chunk.timestamp_us << ','
+      << format_time_us(chunk.timestamp_us) << ",SBU"
+      << static_cast<unsigned>(chunk.line) << ','
+      << static_cast<unsigned>(chunk.valid_count) << ','
+      << hex_bytes(chunk.data) << '\n';
   return out.str();
 }
 

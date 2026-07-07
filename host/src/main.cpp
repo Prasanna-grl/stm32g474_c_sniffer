@@ -51,6 +51,7 @@ struct Args {
   std::string out_raw;
   std::string out_ana_raw;
   std::string out_ana_csv;
+  std::string out_sbu_csv;
   std::string out_events_csv;
   std::string out_header_csv;
   StreamMode mode = StreamMode::Pd;
@@ -87,6 +88,7 @@ void usage(const char *argv0) {
       << "  --out-raw PATH         Save raw live EP1 PD bytes\n"
       << "  --out-ana-raw PATH     Save raw live EP2 analog bytes\n"
       << "  --out-ana-csv PATH     Save decoded analog CSV\n"
+      << "  --out-sbu-csv PATH     Save extracted EP2 SBU raw chunks CSV\n"
       << "  --out-csv PATH         Save combined PD/analog timeline CSV\n"
       << "  --out-events-csv PATH  Alias for --out-csv\n"
       << "  --out-header-csv PATH  Save raw 8-byte record header diagnostics\n"
@@ -130,6 +132,8 @@ Args parse_args(int argc, char **argv) {
       args.out_ana_raw = need_value("--out-ana-raw");
     } else if (arg == "--out-ana-csv") {
       args.out_ana_csv = need_value("--out-ana-csv");
+    } else if (arg == "--out-sbu-csv") {
+      args.out_sbu_csv = need_value("--out-sbu-csv");
     } else if (arg == "--out-csv") {
       args.out_events_csv = need_value("--out-csv");
     } else if (arg == "--out-events-csv") {
@@ -375,6 +379,19 @@ g474::DecodeConfig config_from_args(const Args &args) {
   return config;
 }
 
+std::ofstream open_optional_sbu_csv(const Args &args) {
+  std::ofstream sbu_csv;
+  if (!args.out_sbu_csv.empty()) {
+    sbu_csv.open(args.out_sbu_csv);
+    if (!sbu_csv) {
+      throw std::runtime_error("Unable to open SBU CSV output: " +
+                               args.out_sbu_csv);
+    }
+    sbu_csv << g474::sbu_chunk_csv_header();
+  }
+  return sbu_csv;
+}
+
 int decode_file(const Args &args) {
   const auto bytes = read_file(args.in_bin);
   const auto records = g474::records_from_bytes(bytes);
@@ -443,9 +460,11 @@ int decode_analog_file(const Args &args) {
     }
     events_csv << events_csv_header();
   }
+  std::ofstream sbu_csv = open_optional_sbu_csv(args);
 
   uint64_t analog_count = 0;
   uint64_t unknown_count = 0;
+  uint64_t sbu_count = 0;
   for (std::size_t i = 0; i < records.size(); ++i) {
     auto snapshot = g474::parse_analog_record(i, records[i]);
     if (!snapshot) {
@@ -462,11 +481,21 @@ int decode_analog_file(const Args &args) {
     if (analog_count <= 8) {
       std::cout << g474::format_analog(*snapshot) << '\n';
     }
+    auto sbu_chunk = g474::parse_sbu_chunk(i, records[i]);
+    if (sbu_chunk) {
+      ++sbu_count;
+      if (sbu_csv) {
+        sbu_csv << g474::sbu_chunk_csv_row(*sbu_chunk);
+      }
+    }
   }
 
   std::cout << "Analog file summary: records=" << records.size()
-            << " analog=" << analog_count << " unknown=" << unknown_count
-            << '\n';
+            << " analog=" << analog_count << " unknown=" << unknown_count;
+  if (sbu_csv) {
+    std::cout << " sbu_chunks=" << sbu_count;
+  }
+  std::cout << '\n';
   return 0;
 }
 
@@ -491,6 +520,7 @@ int decode_combined_files(const Args &args) {
 
   const auto analog_bytes = read_file(args.in_ana_bin);
   const auto analog_records = g474::records_from_bytes(analog_bytes);
+  std::ofstream sbu_csv = open_optional_sbu_csv(args);
 
   std::vector<TimelineRow> rows;
   rows.reserve(result.packets.size() + analog_records.size());
@@ -500,6 +530,7 @@ int decode_combined_files(const Args &args) {
 
   uint64_t analog_count = 0;
   uint64_t unknown_count = 0;
+  uint64_t sbu_count = 0;
   for (std::size_t i = 0; i < analog_records.size(); ++i) {
     auto snapshot = g474::parse_analog_record(i, analog_records[i]);
     if (!snapshot) {
@@ -508,6 +539,13 @@ int decode_combined_files(const Args &args) {
     }
     ++analog_count;
     rows.push_back({snapshot->timestamp_us, analog_event_csv_row(*snapshot)});
+    auto sbu_chunk = g474::parse_sbu_chunk(i, analog_records[i]);
+    if (sbu_chunk) {
+      ++sbu_count;
+      if (sbu_csv) {
+        sbu_csv << g474::sbu_chunk_csv_row(*sbu_chunk);
+      }
+    }
   }
 
   std::stable_sort(rows.begin(), rows.end(),
@@ -527,8 +565,11 @@ int decode_combined_files(const Args &args) {
 
   print_summary(result);
   std::cout << "Analog file summary: records=" << analog_records.size()
-            << " analog=" << analog_count << " unknown=" << unknown_count
-            << '\n';
+            << " analog=" << analog_count << " unknown=" << unknown_count;
+  if (sbu_csv) {
+    std::cout << " sbu_chunks=" << sbu_count;
+  }
+  std::cout << '\n';
   std::cout << "combined_csv=" << args.out_events_csv
             << " rows=" << rows.size() << '\n';
   return 0;
@@ -633,11 +674,13 @@ void analog_loop(g474::UsbDevice &dev, const Args &args,
     }
     csv_out << g474::analog_csv_header();
   }
+  std::ofstream sbu_csv = open_optional_sbu_csv(args);
 
   std::vector<uint8_t> partial;
   uint64_t record_index = 0;
   uint64_t analog_count = 0;
   uint64_t unknown_count = 0;
+  uint64_t sbu_count = 0;
 
   while (!g_stop && record_index < args.max_records) {
     auto data =
@@ -677,6 +720,13 @@ void analog_loop(g474::UsbDevice &dev, const Args &args,
           std::lock_guard<std::mutex> lock(g_print_mutex);
           std::cout << g474::format_analog(*snapshot) << '\n';
         }
+        auto sbu_chunk = g474::parse_sbu_chunk(record_index, record);
+        if (sbu_chunk) {
+          ++sbu_count;
+          if (sbu_csv) {
+            sbu_csv << g474::sbu_chunk_csv_row(*sbu_chunk);
+          }
+        }
       } else {
         ++unknown_count;
       }
@@ -688,8 +738,11 @@ void analog_loop(g474::UsbDevice &dev, const Args &args,
   {
     std::lock_guard<std::mutex> lock(g_print_mutex);
     std::cout << "Analog summary: records=" << record_index
-              << " analog=" << analog_count << " unknown=" << unknown_count
-              << '\n';
+              << " analog=" << analog_count << " unknown=" << unknown_count;
+    if (sbu_csv) {
+      std::cout << " sbu_chunks=" << sbu_count;
+    }
+    std::cout << '\n';
     if (!partial.empty()) {
       std::cout << "Analog trailing partial bytes not analyzed: "
                 << partial.size() << '\n';

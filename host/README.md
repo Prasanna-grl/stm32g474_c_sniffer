@@ -94,6 +94,18 @@ Read EP2 analog only and write raw plus CSV:
   --out-csv timeline.csv
 ```
 
+Extract SBU UART chunks carried in EP2 packets to CSV while keeping analog
+capture unchanged:
+
+```sh
+./build/g474_pd_host \
+  --ana \
+  --records 4096 \
+  --read-size 512 \
+  --out-ana-raw capture_ep2.bin \
+  --out-sbu-csv sbu_chunks.csv
+```
+
 Read PD and analog together:
 
 ```sh
@@ -261,6 +273,9 @@ The current analog parser expects the F0-compatible 64-byte analog packet:
 12..13 CC1 mA
 14..15 CC2 mV
 16..17 CC2 mA
+22     SBU source: 0 none, 1 SBU1, 2 SBU2
+23     SBU valid byte count, 0..40
+24..63 SBU raw bytes, valid only when source is SBU1 or SBU2
 ```
 
 The PD summary prints `active_cc=CCx source=edge_stream`. This is based on EP1
