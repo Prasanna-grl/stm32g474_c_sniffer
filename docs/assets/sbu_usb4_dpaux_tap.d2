@@ -1,0 +1,103 @@
+title: "USB-C SBUx Passive Tap: USB4 UART + DisplayPort AUX"
+
+direction: right
+
+classes: {
+  note: {
+    style.fill: "#f7f9fc"
+    style.stroke: "#cad3df"
+  }
+  path_uart: {
+    style.stroke: "#16845f"
+    style.stroke-width: 3
+  }
+  path_aux: {
+    style.stroke: "#0969c3"
+    style.stroke-width: 3
+  }
+}
+
+typec: {
+  label: "USB-C / Type-C Side"
+  sbu: "SBUx tap point\n(SBU1 or SBU2)"
+}
+
+uart_path: {
+  label: "USB4 SBU UART Tap"
+  r_uart: "R_uart\n100R..1k\nseries protection"
+  uart_rx: "STM32 UART RX\nSBU1 -> PC11 / UART4_RX\nSBU2 -> PD2 / UART5_RX"
+}
+
+aux_path: {
+  label: "DisplayPort AUX Tap"
+  c_ac: "C_ac\n100 nF\nAC coupling"
+  aux_node: "AUX_BIAS_NODE\npost-capacitor node"
+  r_comp: "R_comp\n1k typical\npin isolation"
+  comp_in: "STM32 COMP3 input\nSBU1 -> PC1 / COMP3_INP\nSBU2 -> PC0 / COMP3_INM"
+}
+
+bias: {
+  label: "Local Bias"
+  divider: "3.3 V -- 10k -- V_BIAS -- 10k -- GND"
+  filter: "C_filter\n10 uF to GND"
+  r_bias: "R_bias\n100k from AUX_BIAS_NODE to V_BIAS"
+  vbias: "V_BIAS = 1.65 V"
+}
+
+protection: {
+  label: "Protection"
+  esd: "Low-capacitance ESD / clamp\nnear STM32 pin\navoid heavy loading on SBU"
+}
+
+capture: {
+  label: "AUX Capture Flow"
+  comp: "COMP3 differential compare\nPC1 - PC0"
+  hrtim: "HRTIM edge capture"
+  dma: "DMA / EP2 DP AUX packets"
+}
+
+modes: {
+  class: note
+  label: "Mode Rules"
+  usb4: "USB4_UART mode:\nUART RX pins enabled\nCOMP3 inputs left analog/high-Z"
+  dpaux: "DP_AUX mode:\nCOMP3 enabled with hysteresis\nUART RX pins left analog/high-Z"
+}
+
+cautions: {
+  class: note
+  label: "Final Product Notes"
+  passive: "SBU / DP AUX path stays passive sniff-only.\nDo not place an inline buffer in the SBU communication path."
+  uart: "Direct UART tap is DC-coupled.\nUse fail-safe level protection if raw SBU can exceed STM32 limits."
+  layout: "Keep tap traces short and ESD capacitance low."
+}
+
+typec.sbu -> uart_path.r_uart: "direct DC-coupled tap" {
+  class: path_uart
+}
+uart_path.r_uart -> uart_path.uart_rx: "USB4 UART RX" {
+  class: path_uart
+}
+
+typec.sbu -> aux_path.c_ac: "AC-coupled tap" {
+  class: path_aux
+}
+aux_path.c_ac -> aux_path.aux_node: "" {
+  class: path_aux
+}
+aux_path.aux_node -> aux_path.r_comp: "" {
+  class: path_aux
+}
+aux_path.r_comp -> aux_path.comp_in: "DP AUX into COMP3" {
+  class: path_aux
+}
+
+bias.r_bias -> aux_path.aux_node: "biases post-cap node"
+bias.divider -> bias.vbias
+bias.vbias -> bias.r_bias
+bias.filter -> bias.vbias
+
+protection.esd -> aux_path.comp_in: "protect COMP pin"
+
+aux_path.comp_in -> capture.comp
+capture.comp -> capture.hrtim
+capture.hrtim -> capture.dma

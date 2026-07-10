@@ -106,6 +106,41 @@ capture unchanged:
   --out-sbu-csv sbu_chunks.csv
 ```
 
+## DP AUX Bring-Up Decode
+
+Before integrating DP AUX into the C++ host decoder, use the focused Python
+timing decoder to validate the EP2 AUX edge stream:
+
+```sh
+python3 decode_dpaux_edges.py \
+  --in-bin capture_ep2.bin \
+  --half-min 8 \
+  --half-max 16 \
+  --full-min 18 \
+  --full-max 30
+```
+
+At the G474 24 MHz HRTIM capture clock, DisplayPort AUX Manchester timing
+should cluster around:
+
+```text
+0.5 us half bit  ~= 12 ticks
+1.0 us full bit  ~= 24 ticks
+```
+
+The decoder prints an interval histogram, burst summaries, and candidate
+Manchester bit/byte streams for both comparator polarities. It accepts both the
+planned EP2 DP AUX marker `01 40` and the existing EP1-style edge marker while
+the firmware packet format is still being finalized.
+
+For threshold tuning, write an interval CSV:
+
+```sh
+python3 decode_dpaux_edges.py \
+  --in-bin capture_ep2.bin \
+  --out-interval-csv dpaux_intervals.csv
+```
+
 Read PD and analog together:
 
 ```sh
